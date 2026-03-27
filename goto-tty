@@ -1,0 +1,476 @@
+#!/bin/zsh
+
+# ── Parse arguments ───────────────────────────────────────────────────────────
+continuous=0
+args=()
+for arg in "$@"; do
+  [[ $arg == --continuous ]] && continuous=1 || args+=("$arg")
+done
+(( ${#args[@]} > 0 )) && set -- "${args[@]}" || set --
+
+# ── Normalize a raw tty string to ttys003 format ─────────────────────────────
+normalize_tty() {
+  local t=$1
+  t="${t#/dev/}"
+  if [[ $t == s[0-9]* ]]; then
+    t="tty$t"
+  elif [[ $t != ttys* ]]; then
+    t="ttys$t"
+  fi
+  echo "$t"
+}
+
+# ── Curses menu ───────────────────────────────────────────────────────────────
+# Args: outfile [initial_cursor [refresh_secs]]
+# Reads "pid|tty|comm|title" lines from stdin.
+# Exit codes: 0=selected (choice in outfile), 1=cancelled, 2=refresh timeout
+_curses_menu() {
+  local outfile=$1 init_cur=${2:-0} refresh_secs=${3:-0}
+  local tmppy=$(mktemp)
+  cat > "$tmppy" << 'PYEOF'
+import sys, os, curses, time
+
+def run(stdscr, rows, init_cur, refresh_secs):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(2, curses.COLOR_CYAN,  -1)
+    curses.init_pair(3, curses.COLOR_WHITE, -1)
+
+    cur = min(init_cur, len(rows) - 1) if rows else 0
+    hscroll = 0
+    vscroll = 0
+
+    pid_w  = max((len(r[0]) for r in rows), default=3)
+    tty_w  = max((len(r[1]) for r in rows), default=7)
+    proc_w = min(20, max((len(os.path.basename(r[2])) for r in rows), default=7))
+
+    def fmt(i, r):
+        pid, tty, comm, title = r
+        proc = os.path.basename(comm)
+        if len(proc) > proc_w:
+            proc = proc[:proc_w-1] + '\u2026'
+        sel = '>' if i == cur else ' '
+        return f" {sel} {i+1:>3}  {pid:<{pid_w}}  {tty:<{tty_w}}  {proc:<{proc_w}}  {title}"
+
+    hdr = f"   {'#':>3}  {'PID':<{pid_w}}  {'TTY':<{tty_w}}  {'PROCESS':<{proc_w}}  TAB TITLE"
+    max_line_len = max(len(hdr), max((len(fmt(i, r)) for i, r in enumerate(rows)), default=0))
+
+    if refresh_secs > 0:
+        stdscr.timeout(500)
+        next_refresh = time.time() + refresh_secs
+    else:
+        next_refresh = None
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        max_hscroll = max(0, max_line_len - (w - 1))
+        visible = max(0, h - 3)  # data rows between header+sep and footer
+
+        # Keep vscroll in range and cursor visible
+        if cur < vscroll:
+            vscroll = cur
+        elif visible > 0 and cur >= vscroll + visible:
+            vscroll = cur - visible + 1
+        vscroll = max(0, min(vscroll, max(0, len(rows) - visible)))
+
+        def put(y, text, attr=0):
+            vis = text[hscroll:hscroll + w - 1]
+            try:
+                stdscr.addstr(y, 0, vis.ljust(w - 1)[:w - 1], attr)
+            except curses.error:
+                pass
+
+        put(0, hdr, curses.color_pair(2) | curses.A_BOLD)
+        put(1, '\u2500' * 200, curses.color_pair(3))
+
+        for screen_row in range(visible):
+            row_idx = vscroll + screen_row
+            if row_idx >= len(rows):
+                break
+            y = screen_row + 2
+            attr = curses.color_pair(1) | curses.A_BOLD if row_idx == cur else 0
+            put(y, fmt(row_idx, rows[row_idx]), attr)
+
+        if next_refresh is not None:
+            secs_left = max(0, int(next_refresh - time.time()))
+            footer = f"  \u2191\u2193 navigate   \u2190\u2192 scroll   Enter jump   r refresh   q quit   [refresh in {secs_left}s] "
+        else:
+            footer = "  \u2191\u2193 navigate   \u2190\u2192 scroll   Enter select   q cancel "
+        try:
+            stdscr.addstr(h - 1, 0, footer[:w-1].ljust(w-1)[:w-1], curses.A_REVERSE)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+        key = stdscr.getch()
+
+        if next_refresh is not None and time.time() >= next_refresh:
+            return -2  # refresh timeout
+
+        if key == -1:  # no key within timeout interval
+            continue
+        elif key in (curses.KEY_UP, ord('k')) and cur > 0:
+            cur -= 1
+            hscroll = 0
+        elif key in (curses.KEY_DOWN, ord('j')) and cur < len(rows) - 1:
+            cur += 1
+            hscroll = 0
+        elif key == curses.KEY_LEFT:
+            hscroll = max(0, hscroll - 10)
+        elif key == curses.KEY_RIGHT:
+            hscroll = min(max_hscroll, hscroll + 10)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return cur
+        elif key in (ord('q'), 27):
+            return -1
+        elif key == ord('r') and next_refresh is not None:
+            return -2  # manual refresh
+        elif ord('1') <= key <= ord('9'):
+            idx = key - ord('1')
+            if idx < len(rows):
+                return idx
+
+outfile    = sys.argv[1]
+init_cur   = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+refresh_s  = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+
+data = sys.stdin.read().strip()
+rows = []
+for line in data.split('\n'):
+    if not line.strip():
+        continue
+    parts = line.split('|', 3)
+    while len(parts) < 4:
+        parts.append('')
+    rows.append(parts)
+
+if not rows:
+    sys.exit(1)
+
+tty = os.open('/dev/tty', os.O_RDWR)
+os.dup2(tty, 0)
+os.dup2(tty, 1)
+os.close(tty)
+
+result = curses.wrapper(run, rows, init_cur, refresh_s)
+
+if result >= 0:
+    with open(outfile, 'w') as f:
+        f.write(str(result + 1))
+    sys.exit(0)
+elif result == -2:
+    sys.exit(2)
+else:
+    sys.exit(1)
+PYEOF
+  python3 "$tmppy" "$outfile" "$init_cur" "$refresh_secs"
+  local rc=$?
+  rm -f "$tmppy"
+  return $rc
+}
+
+# ── Fetch all tab titles — outputs "ttysXXX|title" lines ─────────────────────
+fetch_tab_titles() {
+  osascript 2>/dev/null <<'EOF'
+set output to ""
+tell application "System Events"
+  set iTerm2Running to exists process "iTerm2"
+  set TerminalRunning to exists process "Terminal"
+end tell
+if iTerm2Running then
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with tb in tabs of w
+        repeat with s in sessions of tb
+          set sessionTTY to (get tty of s)
+          if sessionTTY starts with "/dev/" then set sessionTTY to text 6 thru -1 of sessionTTY
+          set output to output & sessionTTY & "|" & (name of s) & linefeed
+        end repeat
+      end repeat
+    end repeat
+  end tell
+end if
+if TerminalRunning then
+  tell application "Terminal"
+    repeat with wi from 1 to count windows
+      try
+        if (count tabs of window wi) > 0 then
+          set tabTTY to (get tty of tab 1 of window wi)
+          if tabTTY starts with "/dev/" then set tabTTY to text 6 thru -1 of tabTTY
+          set output to output & tabTTY & "|" & (name of window wi) & linefeed
+        end if
+      end try
+    end repeat
+  end tell
+end if
+return output
+EOF
+}
+
+# ── Look up the tab title for a single TTY ───────────────────────────────────
+get_tab_title() {
+  local t=$1
+  osascript 2>/dev/null <<EOF
+tell application "System Events"
+  set iTerm2Running to exists process "iTerm2"
+  set TerminalRunning to exists process "Terminal"
+end tell
+if iTerm2Running then
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with tb in tabs of w
+        repeat with s in sessions of tb
+          set sessionTTY to (get tty of s)
+          if sessionTTY ends with "$t" or sessionTTY is "/dev/$t" then
+            return name of s
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+end if
+if TerminalRunning then
+  tell application "Terminal"
+    repeat with wi from 1 to count windows
+      try
+        set tabTTY to (get tty of tab 1 of window wi)
+        if tabTTY ends with "$t" then
+          return name of window wi
+        end if
+      end try
+    end repeat
+  end tell
+end if
+return ""
+EOF
+}
+
+# ── Try to switch in iTerm2 ───────────────────────────────────────────────────
+try_iterm2() {
+  osascript -e 'tell application "System Events" to return (exists process "iTerm2")' 2>/dev/null | grep -q true || return 1
+  result=$(osascript <<EOF
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        set sessionTTY to (get tty of s)
+        if sessionTTY ends with "$tty" then
+          select w
+          tell w to select t
+          tell t to select s
+          activate
+          return "found"
+        end if
+      end repeat
+    end repeat
+  end repeat
+  return "not found"
+end tell
+EOF
+)
+  [[ $result == "found" ]]
+}
+
+# ── Try to switch in Terminal.app ─────────────────────────────────────────────
+try_terminal() {
+  osascript -e 'tell application "System Events" to return (exists process "Terminal")' 2>/dev/null | grep -q true || return 1
+  result=$(osascript <<EOF
+tell application "Terminal"
+  repeat with wi from 1 to count windows
+    try
+      repeat with ti from 1 to count tabs of window wi
+        set tabTTY to (get tty of tab ti of window wi)
+        if tabTTY ends with "$tty" then
+          return "found"
+        end if
+      end repeat
+    end try
+  end repeat
+  return "not found"
+end tell
+EOF
+)
+  [[ $result == "found" ]] || return 1
+
+  osascript <<EOF &
+delay 0.4
+set targetWI to 0
+set targetPos to {}
+tell application "Terminal"
+  repeat with wi from 1 to count windows
+    set tabTTY to (get tty of tab 1 of window wi)
+    if tabTTY ends with "$tty" then
+      set targetWI to wi
+      set targetPos to position of window wi
+      exit repeat
+    end if
+  end repeat
+  if targetWI > 0 then
+    set index of window targetWI to 1
+  end if
+end tell
+delay 0.2
+if targetWI > 0 then
+  tell application "System Events"
+    tell process "Terminal"
+      set frontmost to true
+      repeat with sw in windows
+        if position of sw = targetPos then
+          perform action "AXRaise" of sw
+          return
+        end if
+      end repeat
+    end tell
+  end tell
+end if
+EOF
+  disown %% 2>/dev/null || true
+  return 0
+}
+
+# ── Jump to $tty ──────────────────────────────────────────────────────────────
+do_jump() {
+  tty=$1
+  local title=$(get_tab_title "$tty")
+  [[ -n $title ]] && echo "Jumping to $tty  ($title)" || echo "Jumping to $tty ..."
+  if try_iterm2 || try_terminal; then
+    return 0
+  else
+    echo "Could not find $tty in any open terminal (iTerm2 or Terminal.app)." >&2
+    echo "The process may be running in a background session, tmux pane, or SSH connection." >&2
+    return 1
+  fi
+}
+
+# ── Get input ─────────────────────────────────────────────────────────────────
+if [[ -z $1 ]]; then
+  print -n "Process name, PID, or TTY: "
+  read input
+else
+  input=$1
+fi
+[[ -z $input ]] && { echo "No input provided." >&2; exit 1; }
+
+# ── PID — resolve and jump directly ──────────────────────────────────────────
+if [[ $input =~ ^[0-9]+$ ]]; then
+  raw=$(ps -o tty= -p "$input" 2>/dev/null | tr -d ' ')
+  [[ -z $raw || $raw == '??' ]] && { echo "No process with PID $input found on a TTY." >&2; exit 1; }
+  do_jump "$(normalize_tty "$raw")"
+  exit $?
+
+# ── TTY — jump directly ───────────────────────────────────────────────────────
+elif [[ $input == /dev/* || $input == ttys* || $input == s[0-9]* ]]; then
+  do_jump "$(normalize_tty "$input")"
+  exit $?
+
+# ── Process name — show menu (with optional continuous mode) ──────────────────
+else
+  last_cursor=0
+  refresh_interval=$(( continuous ? 30 : 0 ))
+
+  # Fetch process list + tab titles and write "pid|tty|comm|title" lines to outfile
+  _fetch_menu_items() {
+    local outfile=$1
+    local query=$2
+    local _matches _m _mpid _mraw _mcomm _mtty _mtitle
+    typeset -A _tab_titles
+
+    _matches=("${(@f)$(ps -eo pid,tty,comm | awk -v name="$query" '
+      tolower($3) ~ tolower(name) && $2 != "??" { print $1, $2, $3 }
+    ')}")
+
+    while IFS='|' read -r t title; do
+      [[ -n $t ]] && _tab_titles[$t]=$title
+    done < <(fetch_tab_titles)
+
+    local _items=()
+    for _m in "${_matches[@]}"; do
+      _mpid=$(echo "$_m" | awk '{print $1}')
+      _mraw=$(echo "$_m" | awk '{print $2}')
+      _mcomm=$(echo "$_m" | awk '{print $3}')
+      _mtty=$(normalize_tty "$_mraw")
+      _mtitle=${_tab_titles[$_mtty]}
+      _items+=("${_mpid}|${_mtty}|${_mcomm}|${_mtitle}")
+    done
+
+    printf '%s\n' "${_items[@]}" > "$outfile"
+  }
+
+  # Initial synchronous fetch
+  current_data=$(mktemp)
+  _fetch_menu_items "$current_data" "$input"
+
+  bg_pid=0
+  next_data=""
+
+  while true; do
+    menu_items=("${(@f)$(cat "$current_data")}")
+
+    if [[ ${#menu_items[@]} -eq 0 || ( ${#menu_items[@]} -eq 1 && -z ${menu_items[1]} ) ]]; then
+      if (( continuous )); then
+        sleep 5
+        _fetch_menu_items "$current_data" "$input"
+        continue
+      else
+        echo "No processes found matching '$input'" >&2
+        rm -f "$current_data"
+        exit 1
+      fi
+    fi
+
+    # Single match in one-shot mode — skip menu
+    if [[ ${#menu_items[@]} -eq 1 && $continuous -eq 0 ]]; then
+      IFS='|' read -r _pid _tty _comm _title <<< "${menu_items[1]}"
+      echo "Found: $_pid $_tty $_comm${_title:+  ($_title)}"
+      do_jump "$_tty"
+      rm -f "$current_data"
+      exit $?
+    fi
+
+    # Start background pre-fetch for next cycle (only in continuous mode)
+    if (( continuous )); then
+      next_data=$(mktemp)
+      _fetch_menu_items "$next_data" "$input" &
+      bg_pid=$!
+    fi
+
+    tmpout=$(mktemp)
+    printf '%s\n' "${menu_items[@]}" | _curses_menu "$tmpout" "$last_cursor" "$refresh_interval"
+    rc=$?
+    choice=$(cat "$tmpout" 2>/dev/null)
+    rm -f "$tmpout"
+
+    case $rc in
+      0)  # selection made
+        last_cursor=$(( choice - 1 ))
+        IFS='|' read -r _pid _tty _comm _title <<< "${menu_items[$choice]}"
+        do_jump "$_tty"
+        if (( continuous )); then
+          # discard stale pre-fetch; start a fresh one after the jump
+          [[ $bg_pid -ne 0 ]] && kill $bg_pid 2>/dev/null
+          rm -f "$next_data"
+          _fetch_menu_items "$current_data" "$input"
+        else
+          rm -f "$current_data"
+          exit $?
+        fi
+        ;;
+      2)  # refresh timeout or manual 'r' — swap in pre-fetched data
+        wait $bg_pid 2>/dev/null
+        mv "$next_data" "$current_data"
+        bg_pid=0
+        next_data=""
+        ;;
+      *)  # q / ESC — exit
+        [[ $bg_pid -ne 0 ]] && kill $bg_pid 2>/dev/null
+        rm -f "$current_data" "$next_data"
+        exit 0
+        ;;
+    esac
+
+    (( continuous )) || break
+  done
+fi
