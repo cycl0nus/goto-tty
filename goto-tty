@@ -118,9 +118,9 @@ def run(stdscr, rows, init_cur, refresh_secs):
         elif key in (curses.KEY_DOWN, ord('j')) and cur < len(rows) - 1:
             cur += 1
             hscroll = 0
-        elif key == curses.KEY_LEFT:
+        elif key in (curses.KEY_LEFT, ord('h')):
             hscroll = max(0, hscroll - 10)
-        elif key == curses.KEY_RIGHT:
+        elif key in (curses.KEY_RIGHT, ord('l')):
             hscroll = min(max_hscroll, hscroll + 10)
         elif key in (curses.KEY_ENTER, 10, 13):
             return cur
